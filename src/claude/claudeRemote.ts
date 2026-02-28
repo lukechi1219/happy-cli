@@ -1,5 +1,6 @@
-import { EnhancedMode, PermissionMode } from "./loop";
-import { query, type QueryOptions as Options, type SDKMessage, type SDKSystemMessage, AbortError, SDKUserMessage } from '@/claude/sdk'
+import { EnhancedMode } from "./loop";
+import { query, type QueryOptions, type SDKMessage, type SDKSystemMessage, AbortError, SDKUserMessage } from '@/claude/sdk'
+import { mapToClaudeMode } from "./utils/permissionMode";
 import { claudeCheckSession } from "./utils/claudeCheckSession";
 import { join, resolve } from 'node:path';
 import { projectPath } from "@/projectPath";
@@ -10,6 +11,7 @@ import { getProjectPath } from "./utils/path";
 import { awaitFileExist } from "@/modules/watcher/awaitFileExist";
 import { systemPrompt } from "./utils/systemPrompt";
 import { PermissionResult } from "./sdk/types";
+import type { JsRuntime } from "./runClaude";
 
 export async function claudeRemote(opts: {
 
@@ -22,6 +24,10 @@ export async function claudeRemote(opts: {
     allowedTools: string[],
     signal?: AbortSignal,
     canCallTool: (toolName: string, input: unknown, mode: EnhancedMode, options: { signal: AbortSignal }) => Promise<PermissionResult>,
+    /** Path to temporary settings file with SessionStart hook (required for session tracking) */
+    hookSettingsPath: string,
+    /** JavaScript runtime to use for spawning Claude Code (default: 'node') */
+    jsRuntime?: JsRuntime,
 
     // Dynamic parameters
     nextMessage: () => Promise<{ message: string, mode: EnhancedMode } | null>,
@@ -107,11 +113,11 @@ export async function claudeRemote(opts: {
 
     // Prepare SDK options
     let mode = initial.mode;
-    const sdkOptions: Options = {
+    const sdkOptions: QueryOptions = {
         cwd: opts.path,
         resume: startFrom ?? undefined,
         mcpServers: opts.mcpServers,
-        permissionMode: initial.mode.permissionMode === 'plan' ? 'plan' : 'default',
+        permissionMode: mapToClaudeMode(initial.mode.permissionMode),
         model: initial.mode.model,
         fallbackModel: initial.mode.fallbackModel,
         customSystemPrompt: initial.mode.customSystemPrompt ? initial.mode.customSystemPrompt + '\n\n' + systemPrompt : undefined,
@@ -119,11 +125,12 @@ export async function claudeRemote(opts: {
         allowedTools: initial.mode.allowedTools ? initial.mode.allowedTools.concat(opts.allowedTools) : opts.allowedTools,
         disallowedTools: initial.mode.disallowedTools,
         canCallTool: (toolName: string, input: unknown, options: { signal: AbortSignal }) => opts.canCallTool(toolName, input, mode, options),
-        executable: 'node',
+        executable: opts.jsRuntime ?? 'node',
         abort: opts.signal,
         pathToClaudeCodeExecutable: (() => {
             return resolve(join(projectPath(), 'scripts', 'claude_remote_launcher.cjs'));
         })(),
+        settingsPath: opts.hookSettingsPath,
     }
 
     // Track thinking state

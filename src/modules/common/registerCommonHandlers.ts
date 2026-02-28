@@ -7,6 +7,7 @@ import { join } from 'path';
 import { run as runRipgrep } from '@/modules/ripgrep/index';
 import { run as runDifftastic } from '@/modules/difftastic/index';
 import { RpcHandlerManager } from '../../api/rpc/RpcHandlerManager';
+import { validatePath } from './pathSecurity';
 
 const execAsync = promisify(exec);
 
@@ -119,8 +120,21 @@ export interface SpawnSessionOptions {
     directory: string;
     sessionId?: string;
     approvedNewDirectoryCreation?: boolean;
-    agent?: 'claude' | 'codex';
+    agent?: 'claude' | 'codex' | 'gemini';
     token?: string;
+    environmentVariables?: {
+        // Anthropic Claude API configuration
+        ANTHROPIC_BASE_URL?: string;        // Custom API endpoint (overrides default)
+        ANTHROPIC_AUTH_TOKEN?: string;      // API authentication token
+        ANTHROPIC_MODEL?: string;           // Model to use (e.g., claude-3-5-sonnet-20241022)
+
+        // Tmux session management environment variables
+        // Based on tmux(1) manual and common tmux usage patterns
+        TMUX_SESSION_NAME?: string;         // Name for tmux session (creates/attaches to named session)
+        TMUX_TMPDIR?: string;               // Temporary directory for tmux server socket files
+        // Note: TMUX_TMPDIR is used by tmux to store socket files when default /tmp is not suitable
+        // Common use case: When /tmp has limited space or different permissions
+    };
 }
 
 export type SpawnSessionResult =
@@ -131,28 +145,48 @@ export type SpawnSessionResult =
 /**
  * Register all RPC handlers with the session
  */
-export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager) {
+export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager, workingDirectory: string) {
 
     // Shell command handler - executes commands in the default shell
     rpcHandlerManager.registerHandler<BashRequest, BashResponse>('bash', async (data) => {
         logger.debug('Shell command request:', data.command);
 
+        // Validate cwd if provided
+        // Special case: "/" means "use shell's default cwd" (used by CLI detection)
+        // Security: Still validate all other paths to prevent directory traversal
+        if (data.cwd && data.cwd !== '/') {
+            const validation = validatePath(data.cwd, workingDirectory);
+            if (!validation.valid) {
+                return { success: false, error: validation.error };
+            }
+        }
+
         try {
             // Build options with shell enabled by default
             // Note: ExecOptions doesn't support boolean for shell, but exec() uses the default shell when shell is undefined
+            // If cwd is "/", use undefined to let shell use its default (respects user's PATH)
             const options: ExecOptions = {
-                cwd: data.cwd,
+                cwd: data.cwd === '/' ? undefined : data.cwd,
                 timeout: data.timeout || 30000, // Default 30 seconds timeout
             };
 
+            logger.debug('Shell command executing...', { cwd: options.cwd, timeout: options.timeout });
             const { stdout, stderr } = await execAsync(data.command, options);
+            logger.debug('Shell command executed, processing result...');
 
-            return {
+            const result = {
                 success: true,
                 stdout: stdout ? stdout.toString() : '',
                 stderr: stderr ? stderr.toString() : '',
                 exitCode: 0
             };
+            logger.debug('Shell command result:', {
+                success: true,
+                exitCode: 0,
+                stdoutLen: result.stdout.length,
+                stderrLen: result.stderr.length
+            });
+            return result;
         } catch (error) {
             const execError = error as NodeJS.ErrnoException & {
                 stdout?: string;
@@ -163,29 +197,49 @@ export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager) {
 
             // Check if the error was due to timeout
             if (execError.code === 'ETIMEDOUT' || execError.killed) {
-                return {
+                const result = {
                     success: false,
                     stdout: execError.stdout || '',
                     stderr: execError.stderr || '',
                     exitCode: typeof execError.code === 'number' ? execError.code : -1,
                     error: 'Command timed out'
                 };
+                logger.debug('Shell command timed out:', {
+                    success: false,
+                    exitCode: result.exitCode,
+                    error: 'Command timed out'
+                });
+                return result;
             }
 
             // If exec fails, it includes stdout/stderr in the error
-            return {
+            const result = {
                 success: false,
                 stdout: execError.stdout ? execError.stdout.toString() : '',
                 stderr: execError.stderr ? execError.stderr.toString() : execError.message || 'Command failed',
                 exitCode: typeof execError.code === 'number' ? execError.code : 1,
                 error: execError.message || 'Command failed'
             };
+            logger.debug('Shell command failed:', {
+                success: false,
+                exitCode: result.exitCode,
+                error: result.error,
+                stdoutLen: result.stdout.length,
+                stderrLen: result.stderr.length
+            });
+            return result;
         }
     });
 
     // Read file handler - returns base64 encoded content
     rpcHandlerManager.registerHandler<ReadFileRequest, ReadFileResponse>('readFile', async (data) => {
         logger.debug('Read file request:', data.path);
+
+        // Validate path is within working directory
+        const validation = validatePath(data.path, workingDirectory);
+        if (!validation.valid) {
+            return { success: false, error: validation.error };
+        }
 
         try {
             const buffer = await readFile(data.path);
@@ -200,6 +254,12 @@ export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager) {
     // Write file handler - with hash verification
     rpcHandlerManager.registerHandler<WriteFileRequest, WriteFileResponse>('writeFile', async (data) => {
         logger.debug('Write file request:', data.path);
+
+        // Validate path is within working directory
+        const validation = validatePath(data.path, workingDirectory);
+        if (!validation.valid) {
+            return { success: false, error: validation.error };
+        }
 
         try {
             // If expectedHash is provided (not null), verify existing file
@@ -261,6 +321,12 @@ export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager) {
     rpcHandlerManager.registerHandler<ListDirectoryRequest, ListDirectoryResponse>('listDirectory', async (data) => {
         logger.debug('List directory request:', data.path);
 
+        // Validate path is within working directory
+        const validation = validatePath(data.path, workingDirectory);
+        if (!validation.valid) {
+            return { success: false, error: validation.error };
+        }
+
         try {
             const entries = await readdir(data.path, { withFileTypes: true });
 
@@ -312,6 +378,12 @@ export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager) {
     // Get directory tree handler - recursive with depth control
     rpcHandlerManager.registerHandler<GetDirectoryTreeRequest, GetDirectoryTreeResponse>('getDirectoryTree', async (data) => {
         logger.debug('Get directory tree request:', data.path, 'maxDepth:', data.maxDepth);
+
+        // Validate path is within working directory
+        const validation = validatePath(data.path, workingDirectory);
+        if (!validation.valid) {
+            return { success: false, error: validation.error };
+        }
 
         // Helper function to build tree recursively
         async function buildTree(path: string, name: string, currentDepth: number): Promise<TreeNode | null> {
@@ -394,6 +466,14 @@ export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager) {
     rpcHandlerManager.registerHandler<RipgrepRequest, RipgrepResponse>('ripgrep', async (data) => {
         logger.debug('Ripgrep request with args:', data.args, 'cwd:', data.cwd);
 
+        // Validate cwd if provided
+        if (data.cwd) {
+            const validation = validatePath(data.cwd, workingDirectory);
+            if (!validation.valid) {
+                return { success: false, error: validation.error };
+            }
+        }
+
         try {
             const result = await runRipgrep(data.args, { cwd: data.cwd });
             return {
@@ -414,6 +494,14 @@ export function registerCommonHandlers(rpcHandlerManager: RpcHandlerManager) {
     // Difftastic handler - raw interface to difftastic
     rpcHandlerManager.registerHandler<DifftasticRequest, DifftasticResponse>('difftastic', async (data) => {
         logger.debug('Difftastic request with args:', data.args, 'cwd:', data.cwd);
+
+        // Validate cwd if provided
+        if (data.cwd) {
+            const validation = validatePath(data.cwd, workingDirectory);
+            if (!validation.valid) {
+                return { success: false, error: validation.error };
+            }
+        }
 
         try {
             const result = await runDifftastic(data.args, { cwd: data.cwd });

@@ -3,8 +3,9 @@ import { createSessionScanner } from './sessionScanner'
 import { RawJSONLines } from '../types'
 import { mkdir, writeFile, appendFile, rm, readFile } from 'node:fs/promises'
 import { join } from 'node:path'
-import { tmpdir, homedir } from 'node:os'
+import { tmpdir } from 'node:os'
 import { existsSync } from 'node:fs'
+import { getProjectPath } from './path'
 
 describe('sessionScanner', () => {
   let testDir: string
@@ -15,11 +16,11 @@ describe('sessionScanner', () => {
   beforeEach(async () => {
     testDir = join(tmpdir(), `scanner-test-${Date.now()}`)
     await mkdir(testDir, { recursive: true })
-    
-    const projectName = testDir.replace(/\//g, '-')
-    projectDir = join(homedir(), '.claude', 'projects', projectName)
+
+    // Use the same path calculation as the scanner to ensure paths match
+    projectDir = getProjectPath(testDir)
     await mkdir(projectDir, { recursive: true })
-    
+
     collectedMessages = []
   })
   
@@ -80,7 +81,7 @@ describe('sessionScanner', () => {
     
     expect(collectedMessages).toHaveLength(2)
     expect(collectedMessages[1].type).toBe('assistant')
-    if (collectedMessages[1].type === 'assistant') {
+    if (collectedMessages[1].type === 'assistant' && collectedMessages[1].message) {
       expect((collectedMessages[1].message.content as any)[0].text).toBe('lol')
     }
     
@@ -138,7 +139,7 @@ describe('sessionScanner', () => {
     // Verify last message is assistant with the file listing
     const lastAssistantMsg = collectedMessages[collectedMessages.length - 1]
     expect(lastAssistantMsg.type).toBe('assistant')
-    if (lastAssistantMsg.type === 'assistant' && lastAssistantMsg.message.content) {
+    if (lastAssistantMsg.type === 'assistant' && lastAssistantMsg.message?.content) {
       const content = (lastAssistantMsg.message.content as any)[0].text
       expect(content).toContain('0-say-lol-session.jsonl')
       expect(content).toContain('readme.md')

@@ -56,6 +56,19 @@ class Configuration {
 
     this.currentCliVersion = packageJson.version
 
+    // Validate variant configuration
+    const variant = process.env.HAPPY_VARIANT || 'stable'
+    if (variant === 'dev' && !this.happyHomeDir.includes('dev')) {
+      console.warn('⚠️  WARNING: HAPPY_VARIANT=dev but HAPPY_HOME_DIR does not contain "dev"')
+      console.warn(`   Current: ${this.happyHomeDir}`)
+      console.warn(`   Expected: Should contain "dev" (e.g., ~/.happy-dev)`)
+    }
+
+    // Visual indicator on CLI startup (only if not daemon process to avoid log clutter)
+    if (!this.isDaemonProcess && variant === 'dev') {
+      console.log('\x1b[33m🔧 DEV MODE\x1b[0m - Data: ' + this.happyHomeDir)
+    }
+
     if (!existsSync(this.happyHomeDir)) {
       mkdirSync(this.happyHomeDir, { recursive: true })
     }
